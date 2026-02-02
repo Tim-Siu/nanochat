@@ -1,3 +1,13 @@
+# Meta Comments
+
+Some highlights:
+1. We used string exact match to verify the answer, as AIME questions have integer golden answer.
+2. We use append "\nPlease reason step by step, and put your final answer within \\boxed{}." to each question as instruction. We then extract the answer from the box.
+3. We extend the `chat_eval` interface to support pass@k metrics. We used the pass@k estimator proposed in the original [Codex](https://arxiv.org/pdf/2107.03374) paper.
+4. Features not tested yet. Hopefully they will work!
+
+Below are sloppy AI generated readme.
+
 # AIME Evaluation
 
 This directory contains evaluation datasets and scripts for AIME (American Invitational Mathematics Examination) 2024 and 2025.
