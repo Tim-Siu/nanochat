@@ -193,13 +193,6 @@ class MoELayer(nn.Module):
             current_out = current_out * topk_weights[token_idx, top_k_pos, None]
             routed_out.index_add_(0, token_idx, current_out.to(routed_out.dtype))
 
-        # Ensure all expert params are in the computation graph so they get zero
-        # gradients (not None) even when not selected. Required for distributed
-        # Muon optimizer which stacks same-shape param grads with torch.stack.
-        for expert in self.experts:
-            for p in expert.parameters():
-                routed_out = routed_out + p.view(-1)[0] * 0.0
-
         routed_out = routed_out.view(B, T, C)
         return shared_out + routed_out
 
@@ -433,10 +426,12 @@ class GPT(nn.Module):
         # Count MoE-specific stats
         moe_total = 0  # total params in MoE layers
         moe_inactive = 0  # params in inactive (non-selected) experts
+        moe_router = 0  # router/gating params in MoE layers
         for i, block in enumerate(self.transformer.h):
             if i in self.moe_layer_indices:
                 moe = block.mlp
                 moe_total += sum(p.numel() for p in moe.parameters())
+                moe_router += sum(p.numel() for p in moe.router.parameters())
                 # Inactive = (n_routed - top_k) experts worth of params
                 one_expert_params = sum(p.numel() for p in moe.experts[0].parameters())
                 n_inactive = self.config.n_routed_experts - self.config.moe_top_k
@@ -451,6 +446,7 @@ class GPT(nn.Module):
             'total': total,
             'moe_total': moe_total,
             'moe_inactive': moe_inactive,
+            'moe_router': moe_router,
             'total_active': total - moe_inactive,
         }
 

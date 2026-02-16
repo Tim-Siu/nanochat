@@ -30,14 +30,14 @@ NPROC_PER_NODE=${NPROC_PER_NODE:-8}
 
 # -----------------------------------------------------------------------------
 # MoE model (d26, layers 0-1 dense, layers 2+ MoE)
-# slightly overtrained: data:param ratio 12 (vs compute-optimal 10.5)
+# match speedrun-style target data:param ratio
 torchrun --standalone --nproc_per_node=$NPROC_PER_NODE \
     -m dev-hetero.train_moe -- \
     --depth=26 \
     --moe-layers="2:" \
     --n-routed-experts=7 \
     --moe-top-k=3 \
-    --target-param-data-ratio=12 \
+    --target-param-data-ratio=8.25 \
     --run=$WANDB_RUN
 
 # Evaluate

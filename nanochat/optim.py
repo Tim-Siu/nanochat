@@ -253,8 +253,10 @@ class MuonAdamW(torch.optim.Optimizer):
         second_momentum_buffer = state["second_momentum_buffer"]
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
-        # Stack grads and params (NOTE: this assumes all params have the same shape)
-        stacked_grads = torch.stack([p.grad for p in params])
+        # Stack grads and params (NOTE: this assumes all params have the same shape).
+        # Some MoE experts may receive no tokens in a step, so grad can be None.
+        # Treat missing grads as zeros to keep updates well-defined.
+        stacked_grads = torch.stack([p.grad if p.grad is not None else torch.zeros_like(p) for p in params])
         stacked_params = torch.stack(params)
 
         # Fill all the 0-D tensors with current values
@@ -365,6 +367,10 @@ class DistMuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        # If any Muon group is very large, overlapping all group comms can create a
+        # large memory spike from temporary stacked buffers. Switch to a lower-memory
+        # per-group execution path in that case.
+        self._low_memory_muon_threshold_bytes = 512 * 1024 * 1024
 
     def _reduce_adamw(self, group: dict, world_size: int) -> dict:
         """Launch async reduce ops for AdamW group. Returns info dict with per-param infos."""
@@ -392,10 +398,15 @@ class DistMuonAdamW(torch.optim.Optimizer):
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
 
-        # Stack grads and zero-pad to padded_num_params
-        grad_stack = torch.stack([p.grad for p in params])
+        # Stack grads and zero-pad to padded_num_params. Some params can have no
+        # gradient in sparse MoE routing; treat those as zeros.
         stacked_grads = torch.empty(padded_num_params, *shape, dtype=dtype, device=device)
-        stacked_grads[:len(params)].copy_(grad_stack)
+        for i, param in enumerate(params):
+            grad = param.grad
+            if grad is None:
+                stacked_grads[i].zero_()
+            else:
+                stacked_grads[i].copy_(grad)
         if len(params) < padded_num_params:
             stacked_grads[len(params):].zero_()
 
@@ -404,6 +415,16 @@ class DistMuonAdamW(torch.optim.Optimizer):
         future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True).get_future()
 
         return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size)
+
+    def _needs_low_memory_mode(self) -> bool:
+        for group in self.param_groups:
+            if group['kind'] != 'muon' or not group['params']:
+                continue
+            p0 = group['params'][0]
+            group_bytes = len(group['params']) * p0.numel() * p0.element_size()
+            if group_bytes >= self._low_memory_muon_threshold_bytes:
+                return True
+        return False
 
     def _compute_adamw(self, group: dict, info: dict, gather_list: list, rank: int, world_size: int) -> None:
         """Wait for reduce, compute AdamW updates, launch gathers for large params."""
@@ -508,6 +529,21 @@ class DistMuonAdamW(torch.optim.Optimizer):
     def step(self):
         rank = dist.get_rank()
         world_size = dist.get_world_size()
+
+        # Lower-memory execution path for very large Muon groups.
+        if self._needs_low_memory_mode():
+            for group in self.param_groups:
+                gather_list: list[dict] = []
+                if group['kind'] == 'adamw':
+                    info = self._reduce_adamw(group, world_size)
+                    self._compute_adamw(group, info, gather_list, rank, world_size)
+                elif group['kind'] == 'muon':
+                    info = self._reduce_muon(group, world_size)
+                    self._compute_muon(group, info, gather_list, rank)
+                else:
+                    raise ValueError(f"Unknown optimizer kind: {group['kind']}")
+                self._finish_gathers(gather_list)
+            return
 
         # Phase 1: launch all async reduce ops
         reduce_infos: list[dict] = []

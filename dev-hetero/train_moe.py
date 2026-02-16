@@ -14,6 +14,7 @@ python -m dev-hetero.train_moe --depth=4 --max-seq-len=512 --device-batch-size=1
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import argparse
+import math
 import time
 from contextlib import nullcontext
 
@@ -61,7 +62,7 @@ parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate 
 parser.add_argument("--target-param-data-ratio", type=float, default=10.5, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # Optimization
 parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size")
-parser.add_argument("--total-batch-size", type=int, default=524288, help="total batch size in tokens")
+parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--weight-decay", type=float, default=0.2, help="cautious weight decay for the Muon optimizer (for weights)")
@@ -122,11 +123,34 @@ token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
-# Model dimensions
+# Model dimensions and config helpers
+def get_model_dims(depth):
+    base_dim = depth * args.aspect_ratio
+    model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
+    num_heads = model_dim // args.head_dim
+    return base_dim, model_dim, num_heads
+
+def get_model_config_kwargs(depth):
+    _, model_dim, num_heads = get_model_dims(depth)
+    return dict(
+        sequence_len=args.max_seq_len, vocab_size=vocab_size,
+        n_layer=depth, n_head=num_heads, n_kv_head=num_heads,
+        n_embd=model_dim, window_pattern=args.window_pattern,
+        # MoE config
+        moe_layers=args.moe_layers,
+        n_routed_experts=args.n_routed_experts,
+        moe_top_k=args.moe_top_k,
+        balance_loss_alpha=args.balance_loss_alpha,
+        balance_bias_gamma=args.balance_bias_gamma,
+    )
+
+def build_model_meta(depth):
+    with torch.device("meta"):
+        model_meta = GPT(GPTConfig(**get_model_config_kwargs(depth)))
+    return model_meta
+
 num_layers = args.depth
-base_dim = args.depth * args.aspect_ratio
-model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
-num_heads = model_dim // args.head_dim
+base_dim, model_dim, num_heads = get_model_dims(args.depth)
 num_kv_heads = num_heads
 head_dim = model_dim // num_heads
 print0(f"num_layers: {num_layers}")
@@ -135,45 +159,11 @@ print0(f"num_heads: {num_heads}")
 print0(f"head_dim: {head_dim}")
 print0(f"num_kv_heads: {num_kv_heads}")
 
-# Gradient accumulation
-tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len
-world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size
-assert args.total_batch_size % world_tokens_per_fwdbwd == 0
-grad_accum_steps = args.total_batch_size // world_tokens_per_fwdbwd
-print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
-print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
-print0(f"Total batch size {args.total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
-
-# Batch size scaling for learning rates
-batch_lr_scale = 1.0
-reference_batch_size = 2**19
-batch_ratio = args.total_batch_size / reference_batch_size
-if batch_ratio != 1.0:
-    batch_lr_scale = batch_ratio ** 0.5
-    print0(f"Scaling LRs by {batch_lr_scale:.4f} for batch size {args.total_batch_size:,} (reference: {reference_batch_size:,})")
-
-# Weight decay scaling
-weight_decay_scaled = args.weight_decay * (12 / args.depth)**2
-if args.depth != 12:
-    print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
-
 # -----------------------------------------------------------------------------
 # Initialize the Model
 
-model_config_kwargs = dict(
-    sequence_len=args.max_seq_len, vocab_size=vocab_size,
-    n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads,
-    n_embd=model_dim, window_pattern=args.window_pattern,
-    # MoE config
-    moe_layers=args.moe_layers,
-    n_routed_experts=args.n_routed_experts,
-    moe_top_k=args.moe_top_k,
-    balance_loss_alpha=args.balance_loss_alpha,
-    balance_bias_gamma=args.balance_bias_gamma,
-)
-with torch.device("meta"):
-    model_config = GPTConfig(**model_config_kwargs)
-    model = GPT(model_config)
+model_config_kwargs = get_model_config_kwargs(args.depth)
+model = build_model_meta(args.depth)
 model.to_empty(device=device)
 model.init_weights()
 
@@ -191,6 +181,10 @@ if resuming:
 orig_model = model
 model = torch.compile(model, dynamic=False)
 
+# -----------------------------------------------------------------------------
+# Scaling laws and muP extrapolations to determine the optimal training horizon,
+# batch size, learning rates, and weight decay.
+
 # Detailed parameter counts
 param_counts = orig_model.num_scaling_params()
 print0(f"Parameter counts:")
@@ -198,10 +192,45 @@ for key, value in param_counts.items():
     print0(f"  {key:24s}: {value:,}")
 num_params = param_counts['total']
 num_active_params = param_counts['total_active']
-# For MoE, use active params for scaling law data ratio
-num_scaling_params = param_counts['transformer_matrices'] + param_counts['lm_head'] - param_counts['moe_inactive']
 num_flops_per_token = model.estimate_flops()
 print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
+
+def get_scaling_params(m):
+    # For MoE, scaling params are transformer matrices + lm_head,
+    # excluding inactive experts and router/gating parameters.
+    params_counts = m.num_scaling_params()
+    scaling_params = (
+        params_counts['transformer_matrices']
+        + params_counts['lm_head']
+        - params_counts['moe_inactive']
+        - params_counts['moe_router']
+    )
+    return scaling_params
+
+num_scaling_params = get_scaling_params(orig_model)
+target_tokens = int(args.target_param_data_ratio * num_scaling_params)
+
+# d12 reference for batch-size extrapolation (Power Lines: Bopt ∝ D^0.383)
+d12_ref = build_model_meta(12)
+D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref)
+B_REF = 2**19
+
+total_batch_size = args.total_batch_size
+if total_batch_size == -1:
+    batch_size_ratio = target_tokens / D_REF
+    predicted_batch_size = B_REF * batch_size_ratio ** 0.383
+    total_batch_size = 2 ** round(math.log2(predicted_batch_size))
+    print0(f"Auto-computed optimal batch size: {total_batch_size:,} tokens")
+
+batch_lr_scale = 1.0
+batch_ratio = total_batch_size / B_REF
+if batch_ratio != 1.0:
+    batch_lr_scale = batch_ratio ** 0.5
+    print0(f"Scaling LRs by {batch_lr_scale:.4f} for batch size {total_batch_size:,} (reference: {B_REF:,})")
+
+weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * (D_REF / target_tokens)
+if weight_decay_scaled != args.weight_decay:
+    print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
 
 # Calculate number of iterations
 assert args.num_iterations > 0 or args.target_param_data_ratio > 0 or args.target_flops > 0
@@ -209,17 +238,16 @@ if args.num_iterations > 0:
     num_iterations = args.num_iterations
     print0(f"Using user-provided number of iterations: {num_iterations:,}")
 elif args.target_flops > 0:
-    num_iterations = round(args.target_flops / (num_flops_per_token * args.total_batch_size))
+    num_iterations = round(args.target_flops / (num_flops_per_token * total_batch_size))
     print0(f"Calculated number of iterations from target FLOPs: {num_iterations:,}")
 elif args.target_param_data_ratio > 0:
-    target_tokens = int(args.target_param_data_ratio * num_scaling_params)
-    num_iterations = target_tokens // args.total_batch_size
+    num_iterations = target_tokens // total_batch_size
     print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
 else:
     raise ValueError("No training horizon specified")
-total_tokens = args.total_batch_size * num_iterations
+total_tokens = total_batch_size * num_iterations
 print0(f"Total number of training tokens: {total_tokens:,}")
-print0(f"Tokens : Active scaling params ratio: {args.total_batch_size * num_iterations / num_scaling_params:.2f}")
+print0(f"Tokens : Active scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}")
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
 # -----------------------------------------------------------------------------
@@ -284,11 +312,20 @@ else:
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
 
+# Figure out needed gradient accumulation micro-steps to hit the target total batch size
+tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len
+world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size
+assert total_batch_size % world_tokens_per_fwdbwd == 0
+grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
+print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
+print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
+print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+
 # -----------------------------------------------------------------------------
 # Training loop
 while True:
     last_step = step == num_iterations
-    flops_so_far = num_flops_per_token * args.total_batch_size * step
+    flops_so_far = num_flops_per_token * total_batch_size * step
 
     # Evaluate val bpb
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
@@ -405,8 +442,8 @@ while True:
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * step / num_iterations
-    tok_per_sec = int(args.total_batch_size / dt)
-    flops_per_sec = num_flops_per_token * args.total_batch_size / dt
+    tok_per_sec = int(total_batch_size / dt)
+    flops_per_sec = num_flops_per_token * total_batch_size / dt
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
     if step > 10:
         total_training_time += dt
@@ -452,7 +489,7 @@ get_report().log(section="MoE Base model training", data=[
         "Number of FLOPs per token": f"{num_flops_per_token:e}",
         "Calculated number of iterations": num_iterations,
         "Number of training tokens": total_tokens,
-        "Tokens : Active scaling params ratio": args.total_batch_size * num_iterations / num_scaling_params,
+        "Tokens : Active scaling params ratio": total_batch_size * num_iterations / num_scaling_params,
         "DDP world size": ddp_world_size,
         "MoE layers": args.moe_layers,
         "Routed experts": args.n_routed_experts,
