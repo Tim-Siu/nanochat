@@ -16,6 +16,7 @@ from functools import partial
 from dataclasses import dataclass, field
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -175,14 +176,16 @@ class MoELayer(nn.Module):
         # Save for balance loss
         self._last_router_logits = router_logits
         self._last_topk_indices = topk_indices
-        # Accumulate expert counts for bias updates across gradient accumulation
-        with torch.no_grad():
-            N = topk_indices.shape[0]
-            for k in range(self.config.moe_top_k):
-                self._accumulated_expert_counts.scatter_add_(
-                    0, topk_indices[:, k],
-                    torch.ones(N, device=topk_indices.device))
-            self._accumulated_tokens += N
+        # Accumulate expert counts for bias updates across gradient accumulation.
+        # Only collect training traffic (exclude eval/sample forwards).
+        if self.training:
+            with torch.no_grad():
+                N = topk_indices.shape[0]
+                for k in range(self.config.moe_top_k):
+                    self._accumulated_expert_counts.scatter_add_(
+                        0, topk_indices[:, k],
+                        torch.ones(N, device=topk_indices.device))
+                self._accumulated_tokens += N
 
         # Compute routed expert outputs
         x_flat = x.view(-1, C)  # (N, C)
@@ -563,8 +566,15 @@ class GPT(nn.Module):
 
             n_experts = self.config.n_routed_experts
             expert_counts = moe._accumulated_expert_counts
+            accumulated_tokens = moe._accumulated_tokens
+            # Match DeepSeek-style "global batch" bias updates in DDP.
+            if dist.is_initialized():
+                expert_counts = expert_counts.clone()
+                accumulated_tokens = accumulated_tokens.clone()
+                dist.all_reduce(expert_counts, op=dist.ReduceOp.SUM)
+                dist.all_reduce(accumulated_tokens, op=dist.ReduceOp.SUM)
             # Expected count per expert if balanced
-            expected = moe._accumulated_tokens * self.config.moe_top_k / n_experts
+            expected = accumulated_tokens * self.config.moe_top_k / n_experts
             # Increase bias for underloaded experts, decrease for overloaded
             moe.router.balance_bias += gamma * (expected - expert_counts).sign()
             # Reset accumulators
