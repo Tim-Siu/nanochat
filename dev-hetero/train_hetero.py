@@ -139,25 +139,25 @@ def get_model_dims(depth):
     num_heads = model_dim // args.head_dim
     return base_dim, model_dim, num_heads
 
-def get_model_config_kwargs(depth):
+def get_model_config_kwargs(depth, include_hetero=True):
     _, model_dim, num_heads = get_model_dims(depth)
     return dict(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads,
         n_embd=model_dim, window_pattern=args.window_pattern,
         # MoE config
-        moe_layers=args.moe_layers,
+        moe_layers=args.moe_layers if include_hetero else "",
         n_routed_experts=args.n_routed_experts,
         moe_top_k=args.moe_top_k,
         balance_loss_alpha=args.balance_loss_alpha,
         balance_bias_gamma=args.balance_bias_gamma,
         # Parameter sharing config
-        shared_mlp_groups=args.shared_mlp_groups,
+        shared_mlp_groups=args.shared_mlp_groups if include_hetero else "",
     )
 
-def build_model_meta(depth):
+def build_model_meta(depth, include_hetero=True):
     with torch.device("meta"):
-        model_meta = GPT(GPTConfig(**get_model_config_kwargs(depth)))
+        model_meta = GPT(GPTConfig(**get_model_config_kwargs(depth, include_hetero=include_hetero)))
     return model_meta
 
 num_layers = args.depth
@@ -278,7 +278,7 @@ num_scaling_params = get_scaling_params(orig_model)
 target_tokens = int(args.target_param_data_ratio * num_scaling_params)
 
 # d12 reference for batch-size extrapolation (Power Lines: Bopt ∝ D^0.383)
-d12_ref = build_model_meta(12)
+d12_ref = build_model_meta(12, include_hetero=False)
 D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref)
 B_REF = 2**19
 
