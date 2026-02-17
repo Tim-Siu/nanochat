@@ -16,7 +16,7 @@ import time
 import wandb
 import torch
 from contextlib import nullcontext
-from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type
+from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, get_run_dir, autodetect_device_type
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint
 from nanochat.loss_eval import evaluate_bpb
@@ -74,6 +74,10 @@ get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else l
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
+
+# Set per-run output directory (used by checkpoint, eval, report subsystems)
+if args.run != "dummy":
+    os.environ.setdefault("NANOCHAT_RUN", args.run)
 
 # Load the model and tokenizer
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
@@ -285,7 +289,7 @@ while True:
     # save checkpoint at the end of the run (only on master process)
     if master_process and last_step and not args.dry_run:
         output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
-        checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
+        checkpoint_dir = os.path.join(get_run_dir(), "chatsft_checkpoints", output_dirname)
         save_checkpoint(
             checkpoint_dir,
             step,

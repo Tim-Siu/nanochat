@@ -58,6 +58,23 @@ def get_base_dir():
     os.makedirs(nanochat_dir, exist_ok=True)
     return nanochat_dir
 
+def get_run_dir():
+    """Per-run output directory for checkpoints, eval results, and reports.
+    Falls back to base_dir when no run name is active (backward compatible).
+    Resolution order: NANOCHAT_RUN env var > WANDB_RUN env var (if not "dummy") > base_dir.
+    """
+    base_dir = get_base_dir()
+    run_name = os.environ.get("NANOCHAT_RUN")
+    if not run_name:
+        wandb_run = os.environ.get("WANDB_RUN")
+        if wandb_run and wandb_run != "dummy":
+            run_name = wandb_run
+    if run_name:
+        run_dir = os.path.join(base_dir, "runs", run_name)
+        os.makedirs(run_dir, exist_ok=True)
+        return run_dir
+    return base_dir
+
 def download_file_with_lock(url, filename, postprocess_fn=None):
     """
     Downloads a file from a URL to a local path in the base directory.

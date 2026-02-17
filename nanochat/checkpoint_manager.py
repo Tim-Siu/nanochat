@@ -8,7 +8,7 @@ import json
 import logging
 import torch
 
-from nanochat.common import get_base_dir
+from nanochat.common import get_run_dir
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
 from nanochat.common import setup_default_logging
@@ -167,6 +167,6 @@ def load_model(source, *args, **kwargs):
         "sft": "chatsft_checkpoints",
         "rl": "chatrl_checkpoints",
     }[source]
-    base_dir = get_base_dir()
-    checkpoints_dir = os.path.join(base_dir, model_dir)
+    run_dir = get_run_dir()
+    checkpoints_dir = os.path.join(run_dir, model_dir)
     return load_model_from_dir(checkpoints_dir, *args, **kwargs)

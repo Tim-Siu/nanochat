@@ -12,9 +12,6 @@ export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 mkdir -p "$NANOCHAT_BASE_DIR"
 
 # Python venv setup
-command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
-[ -d ".venv" ] || uv venv
-uv sync --extra gpu
 source .venv/bin/activate
 
 # wandb setup

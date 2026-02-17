@@ -24,7 +24,7 @@ import torch
 import torch.distributed as dist
 from contextlib import nullcontext
 
-from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, autodetect_device_type
+from nanochat.common import compute_init, compute_cleanup, print0, get_run_dir, DummyWandb, autodetect_device_type
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
 from tasks.gsm8k import GSM8K
@@ -74,6 +74,10 @@ autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if dev
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl", name=args.run, config=user_config)
+
+# Set per-run output directory (used by checkpoint, eval, report subsystems)
+if args.run != "dummy":
+    os.environ.setdefault("NANOCHAT_RUN", args.run)
 
 # Init model and tokenizer
 model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step)
@@ -314,7 +318,7 @@ for step in range(num_steps):
 
     # Master process saves the model once in a while. Skip first step. Save last step.
     if master_process and ((step > 0 and step % args.save_every == 0) or step == num_steps - 1):
-        base_dir = get_base_dir()
+        base_dir = get_run_dir()
         depth = model.config.n_layer
         output_dirname = args.model_tag if args.model_tag else f"d{depth}" # base the model tag on the depth of the base model
         checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", output_dirname)
