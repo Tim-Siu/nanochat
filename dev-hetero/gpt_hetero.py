@@ -165,7 +165,7 @@ class MoELayer(nn.Module):
         self._topk_indices_list = []
         # Accumulated expert counts across micro-batches for bias updates
         self.register_buffer("_accumulated_expert_counts", torch.zeros(config.n_routed_experts))
-        self._accumulated_tokens = 0
+        self.register_buffer("_accumulated_tokens", torch.tensor(0, dtype=torch.long))
 
     def forward(self, x):
         # Shared expert (always active)
@@ -230,21 +230,39 @@ def _parse_moe_layers(moe_layers_str, n_layer):
 
 
 def _parse_shared_mlp_groups(shared_mlp_groups_str, n_layer):
-    """Parse slice notation string into a sorted list of layer indices that share MLP params.
-    Examples: "3:6" -> [3, 4, 5], "" -> []
+    """Parse sharing group specification into a list of groups (list of list of layer indices).
+
+    Supported formats (comma-separated specs, each spec is a slice):
+      "3:6"         → one group [3,4,5]
+      "3:9:3"       → groups of 3: [[3,4,5], [6,7,8]]
+      "3:6,8:11"    → two groups [[3,4,5], [8,9,10]]
+      "3:9:3,18:24:3" → four groups [[3,4,5], [6,7,8], [18,19,20], [21,22,23]]
+      ""            → [] (no sharing)
     """
     if not shared_mlp_groups_str or shared_mlp_groups_str.strip() == "":
         return []
-    s = shared_mlp_groups_str.strip()
-    parts = s.split(":")
-    if len(parts) == 1:
-        return [int(parts[0])]
-    elif len(parts) == 2:
-        start = int(parts[0]) if parts[0] else 0
-        end = int(parts[1]) if parts[1] else n_layer
-        return list(range(start, end))
-    else:
-        raise ValueError(f"Invalid shared_mlp_groups format: {shared_mlp_groups_str}")
+    groups = []
+    for spec in shared_mlp_groups_str.split(","):
+        spec = spec.strip()
+        parts = spec.split(":")
+        if len(parts) == 1:
+            # Single layer — not useful for sharing but valid
+            groups.append([int(parts[0])])
+        elif len(parts) == 2:
+            start = int(parts[0]) if parts[0] else 0
+            end = int(parts[1]) if parts[1] else n_layer
+            groups.append(list(range(start, end)))
+        elif len(parts) == 3:
+            start = int(parts[0]) if parts[0] else 0
+            end = int(parts[1]) if parts[1] else n_layer
+            step = int(parts[2])
+            for g_start in range(start, end, step):
+                g_end = min(g_start + step, end)
+                if g_end - g_start > 1:  # only create group if more than 1 layer
+                    groups.append(list(range(g_start, g_end)))
+        else:
+            raise ValueError(f"Invalid shared_mlp_groups spec: '{spec}'")
+    return groups
 
 
 class Block(nn.Module):
@@ -272,7 +290,7 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         self.moe_layer_indices = _parse_moe_layers(config.moe_layers, config.n_layer)
-        self.shared_mlp_layer_indices = _parse_shared_mlp_groups(config.shared_mlp_groups, config.n_layer)
+        self.shared_mlp_groups = _parse_shared_mlp_groups(config.shared_mlp_groups, config.n_layer)
         self.window_sizes = self._compute_window_sizes(config)
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
@@ -297,16 +315,15 @@ class GPT(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
 
         # Apply MLP parameter sharing
-        if self.shared_mlp_layer_indices:
-            layers = self.shared_mlp_layer_indices
+        for group in self.shared_mlp_groups:
             # Assert: no mixing dense and MoE in a sharing group
-            types_in_group = [layer_idx in self.moe_layer_indices for layer_idx in layers]
+            types_in_group = [layer_idx in self.moe_layer_indices for layer_idx in group]
             assert all(t == types_in_group[0] for t in types_in_group), \
-                f"Shared MLP group {layers}: cannot mix dense and MoE layers. " \
-                f"Types: {dict(zip(layers, ['moe' if t else 'dense' for t in types_in_group]))}"
+                f"Shared MLP group {group}: cannot mix dense and MoE layers. " \
+                f"Types: {dict(zip(group, ['moe' if t else 'dense' for t in types_in_group]))}"
             # Replace later blocks' .mlp with the canonical (first) block's .mlp
-            canonical = layers[0]
-            for layer_idx in layers[1:]:
+            canonical = group[0]
+            for layer_idx in group[1:]:
                 self.transformer.h[layer_idx].mlp = self.transformer.h[canonical].mlp
 
         # Print MoE info
@@ -317,8 +334,9 @@ class GPT(nn.Module):
             print0(f"MoE layer indices: {sorted(self.moe_layer_indices)}")
 
         # Print sharing info
-        if self.shared_mlp_layer_indices:
-            print0(f"MLP sharing: layers {self.shared_mlp_layer_indices} share MLP params (canonical: layer {self.shared_mlp_layer_indices[0]})")
+        if self.shared_mlp_groups:
+            for i, group in enumerate(self.shared_mlp_groups):
+                print0(f"MLP sharing group {i}: layers {group} (canonical: layer {group[0]})")
 
     @torch.no_grad()
     def init_weights(self):
@@ -337,8 +355,8 @@ class GPT(nn.Module):
 
         # Determine which layers are non-canonical shared (skip MLP init for them)
         shared_non_canonical = set()
-        if self.shared_mlp_layer_indices:
-            shared_non_canonical = set(self.shared_mlp_layer_indices[1:])
+        for group in self.shared_mlp_groups:
+            shared_non_canonical.update(group[1:])
 
         for i, block in enumerate(self.transformer.h):
             # Attention init (same for all layers, always independent)
@@ -629,7 +647,7 @@ class GPT(nn.Module):
                 continue
             processed_moe_ids.add(moe_id)
 
-            if moe._accumulated_tokens == 0:
+            if moe._accumulated_tokens.item() == 0:
                 continue
 
             n_experts = self.config.n_routed_experts
@@ -640,7 +658,7 @@ class GPT(nn.Module):
             moe.router.balance_bias += gamma * (expected - expert_counts).sign()
             # Reset accumulators
             moe._accumulated_expert_counts.zero_()
-            moe._accumulated_tokens = 0
+            moe._accumulated_tokens.zero_()
             # Clear saved state
             moe._router_logits_list = []
             moe._topk_indices_list = []

@@ -163,7 +163,7 @@ class MoELayer(nn.Module):
         self._last_topk_indices = None
         # Accumulated expert counts across micro-batches for bias updates
         self.register_buffer("_accumulated_expert_counts", torch.zeros(config.n_routed_experts))
-        self._accumulated_tokens = 0
+        self.register_buffer("_accumulated_tokens", torch.tensor(0, dtype=torch.long))
 
     def forward(self, x):
         # Shared expert (always active)
@@ -558,7 +558,7 @@ class GPT(nn.Module):
             if i not in self.moe_layer_indices:
                 continue
             moe = block.mlp
-            if moe._accumulated_tokens == 0:
+            if moe._accumulated_tokens.item() == 0:
                 continue
 
             n_experts = self.config.n_routed_experts
@@ -569,7 +569,7 @@ class GPT(nn.Module):
             moe.router.balance_bias += gamma * (expected - expert_counts).sign()
             # Reset accumulators
             moe._accumulated_expert_counts.zero_()
-            moe._accumulated_tokens = 0
+            moe._accumulated_tokens.zero_()
             # Clear saved state
             moe._last_router_logits = None
             moe._last_topk_indices = None
