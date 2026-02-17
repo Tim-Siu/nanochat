@@ -1,15 +1,15 @@
 """
-GPT model with Mixture of Experts (MoE) support.
-Based on nanochat/gpt.py with the following additions:
-- MoERouter: sigmoid gating with top-k selection and bias-based load balancing
-- MoELayer: 1 shared expert + N routed experts (configurable)
-- Configurable per-layer MoE vs dense MLP selection
-- Auxiliary balance loss + heuristic bias adjustment (DeepSeek-V3 style)
+GPT model with Mixture of Experts (MoE) support and MLP parameter sharing (loop transformer).
+Based on dev-hetero/gpt_moe.py with the following additions:
+- Configurable MLP parameter sharing across layers (shared_mlp_groups)
+- Each layer keeps its own attention, but layers in a sharing group reuse the same MLP
+- Assert that shared layers are all dense or all MoE (no mixing)
 
 Design:
-- 1 shared expert (always active) + 7 routed experts (top-3 selected) = 4 active
+- MoE: 1 shared expert (always active) + 7 routed experts (top-3 selected) = 4 active
 - Each expert has intermediate_dim = n_embd (1/4 of dense MLP's 4*n_embd)
 - Total MoE layer params = 2x dense, active FLOPs = 1x dense
+- Parameter sharing: layers in a group share the same MLP module (attention stays independent)
 """
 
 from functools import partial
@@ -38,6 +38,8 @@ class GPTConfig:
     moe_top_k: int = 3
     balance_loss_alpha: float = 0.0001
     balance_bias_gamma: float = 0.001
+    # Parameter sharing config
+    shared_mlp_groups: str = ""  # slice notation for which layers share MLP (e.g. "3:6" = layers 3,4,5 share)
 
 
 def norm(x):
@@ -158,9 +160,9 @@ class MoELayer(nn.Module):
             for _ in range(config.n_routed_experts)
         ])
         self.router = MoERouter(config)
-        # Stored during forward for balance loss computation
-        self._last_router_logits = None
-        self._last_topk_indices = None
+        # Accumulated during forward for balance loss computation (list for shared layers)
+        self._router_logits_list = []
+        self._topk_indices_list = []
         # Accumulated expert counts across micro-batches for bias updates
         self.register_buffer("_accumulated_expert_counts", torch.zeros(config.n_routed_experts))
         self._accumulated_tokens = 0
@@ -172,9 +174,9 @@ class MoELayer(nn.Module):
         # Route tokens to experts
         B, T, C = x.shape
         topk_indices, topk_weights, router_logits = self.router(x)
-        # Save for balance loss
-        self._last_router_logits = router_logits
-        self._last_topk_indices = topk_indices
+        # Accumulate for balance loss (supports shared MoE layers called multiple times)
+        self._router_logits_list.append(router_logits)
+        self._topk_indices_list.append(topk_indices)
         # Accumulate expert counts for bias updates across gradient accumulation
         with torch.no_grad():
             N = topk_indices.shape[0]
@@ -227,6 +229,24 @@ def _parse_moe_layers(moe_layers_str, n_layer):
         raise ValueError(f"Invalid moe_layers format: {moe_layers_str}")
 
 
+def _parse_shared_mlp_groups(shared_mlp_groups_str, n_layer):
+    """Parse slice notation string into a sorted list of layer indices that share MLP params.
+    Examples: "3:6" -> [3, 4, 5], "" -> []
+    """
+    if not shared_mlp_groups_str or shared_mlp_groups_str.strip() == "":
+        return []
+    s = shared_mlp_groups_str.strip()
+    parts = s.split(":")
+    if len(parts) == 1:
+        return [int(parts[0])]
+    elif len(parts) == 2:
+        start = int(parts[0]) if parts[0] else 0
+        end = int(parts[1]) if parts[1] else n_layer
+        return list(range(start, end))
+    else:
+        raise ValueError(f"Invalid shared_mlp_groups format: {shared_mlp_groups_str}")
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx, use_moe=False):
         super().__init__()
@@ -252,6 +272,7 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
         self.moe_layer_indices = _parse_moe_layers(config.moe_layers, config.n_layer)
+        self.shared_mlp_layer_indices = _parse_shared_mlp_groups(config.shared_mlp_groups, config.n_layer)
         self.window_sizes = self._compute_window_sizes(config)
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
@@ -275,6 +296,19 @@ class GPT(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
+        # Apply MLP parameter sharing
+        if self.shared_mlp_layer_indices:
+            layers = self.shared_mlp_layer_indices
+            # Assert: no mixing dense and MoE in a sharing group
+            types_in_group = [layer_idx in self.moe_layer_indices for layer_idx in layers]
+            assert all(t == types_in_group[0] for t in types_in_group), \
+                f"Shared MLP group {layers}: cannot mix dense and MoE layers. " \
+                f"Types: {dict(zip(layers, ['moe' if t else 'dense' for t in types_in_group]))}"
+            # Replace later blocks' .mlp with the canonical (first) block's .mlp
+            canonical = layers[0]
+            for layer_idx in layers[1:]:
+                self.transformer.h[layer_idx].mlp = self.transformer.h[canonical].mlp
+
         # Print MoE info
         n_moe = len(self.moe_layer_indices)
         n_dense = config.n_layer - n_moe
@@ -282,12 +316,17 @@ class GPT(nn.Module):
             print0(f"MoE config: {n_dense} dense layers + {n_moe} MoE layers (1 shared + {config.n_routed_experts} routed, top-{config.moe_top_k})")
             print0(f"MoE layer indices: {sorted(self.moe_layer_indices)}")
 
+        # Print sharing info
+        if self.shared_mlp_layer_indices:
+            print0(f"MLP sharing: layers {self.shared_mlp_layer_indices} share MLP params (canonical: layer {self.shared_mlp_layer_indices[0]})")
+
     @torch.no_grad()
     def init_weights(self):
         """
         Initialize the full model.
         Dense layers: same as original nanochat.
         MoE layers: expert c_fc -> uniform, expert c_proj -> zeros, router -> normal.
+        Shared MLP layers: only initialize the canonical (first) block's MLP.
         """
         # Embedding and unembedding
         torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
@@ -296,12 +335,21 @@ class GPT(nn.Module):
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5
 
+        # Determine which layers are non-canonical shared (skip MLP init for them)
+        shared_non_canonical = set()
+        if self.shared_mlp_layer_indices:
+            shared_non_canonical = set(self.shared_mlp_layer_indices[1:])
+
         for i, block in enumerate(self.transformer.h):
-            # Attention init (same for all layers)
+            # Attention init (same for all layers, always independent)
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
+
+            # Skip MLP init for non-canonical shared layers (same object, already initialized)
+            if i in shared_non_canonical:
+                continue
 
             if i in self.moe_layer_indices:
                 # MoE layer init
@@ -380,6 +428,7 @@ class GPT(nn.Module):
         """
         Return the estimated FLOPs per token for the model (forward + backward).
         For MoE layers, only count activated params (shared + top_k routed experts).
+        Shared MLP params are counted once per layer they appear in (FLOPs = actual compute).
         """
         # Start with non-MoE parameters
         total_active_matmul_params = 0
@@ -424,17 +473,26 @@ class GPT(nn.Module):
     def num_scaling_params(self):
         """
         Return detailed parameter counts for scaling law analysis.
-        For MoE models, includes both total and active parameter counts.
+        For shared MLP layers, count shared params once per layer they appear in
+        (so that scaling params match the non-shared baseline for fair ablation).
         """
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
+        # Count per-block with fresh memo each time, so shared params are counted N times
+        transformer_matrices = sum(
+            sum(p.numel() for p in block.parameters())
+            for block in self.transformer.h
+        )
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
-        assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
 
-        # Count MoE-specific stats
+        # Unique param count (deduped) for reporting
+        transformer_matrices_unique = sum(p.numel() for p in self.transformer.h.parameters())
+        total_unique = wte + value_embeds + lm_head + transformer_matrices_unique + scalars
+        assert total_unique == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
+
+        # Count MoE-specific stats (per-layer, shared counted N times)
         moe_total = 0  # total params in MoE layers
         moe_inactive = 0  # params in inactive (non-selected) experts
         moe_router = 0  # router/gating params in MoE layers
@@ -453,8 +511,10 @@ class GPT(nn.Module):
             'value_embeds': value_embeds,
             'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
+            'transformer_matrices_unique': transformer_matrices_unique,
             'scalars': scalars,
             'total': total,
+            'total_unique': total_unique,
             'moe_total': moe_total,
             'moe_inactive': moe_inactive,
             'moe_router': moe_router,
@@ -465,7 +525,7 @@ class GPT(nn.Module):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
-        # Separate router params from matrix params
+        # Separate router params from matrix params (named_parameters deduplicates shared params)
         router_params = []
         matrix_params = []
         for name, p in self.transformer.h.named_parameters():
@@ -480,7 +540,7 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
 
-        # Verify all params are accounted for
+        # Verify all params are accounted for (self.parameters() deduplicates)
         total_grouped = (len(matrix_params) + len(router_params) + len(embedding_params) +
                         len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
         assert len(list(self.parameters())) == total_grouped, \
@@ -526,11 +586,14 @@ class GPT(nn.Module):
         Switch Transformer style: alpha * N * sum(f_i * p_i)
         where f_i = fraction of tokens routed to expert i,
               p_i = mean routing probability for expert i.
+        Handles shared MoE layers by aggregating stats from all forward passes.
         """
-        router_logits = moe_layer._last_router_logits  # (N, n_experts)
-        topk_indices = moe_layer._last_topk_indices  # (N, top_k)
-        if router_logits is None:
+        if not moe_layer._router_logits_list:
             return 0.0
+
+        # Concatenate stats from all forward passes (supports shared layers)
+        router_logits = torch.cat(moe_layer._router_logits_list, dim=0)  # (total_N, n_experts)
+        topk_indices = torch.cat(moe_layer._topk_indices_list, dim=0)  # (total_N, top_k)
 
         n_experts = self.config.n_routed_experts
         N = router_logits.shape[0]
@@ -552,12 +615,20 @@ class GPT(nn.Module):
         Update balance bias buffers for all MoE layers (DeepSeek-V3 style).
         Called after each optimizer step. Uses expert counts accumulated across
         all micro-batches in the gradient accumulation cycle.
+        Handles shared MoE layers by deduplicating via object identity.
         """
         gamma = self.config.balance_bias_gamma
+        # Track which MoE layers we've already processed (for shared layers)
+        processed_moe_ids = set()
         for i, block in enumerate(self.transformer.h):
             if i not in self.moe_layer_indices:
                 continue
             moe = block.mlp
+            moe_id = id(moe)
+            if moe_id in processed_moe_ids:
+                continue
+            processed_moe_ids.add(moe_id)
+
             if moe._accumulated_tokens == 0:
                 continue
 
@@ -571,8 +642,22 @@ class GPT(nn.Module):
             moe._accumulated_expert_counts.zero_()
             moe._accumulated_tokens = 0
             # Clear saved state
-            moe._last_router_logits = None
-            moe._last_topk_indices = None
+            moe._router_logits_list = []
+            moe._topk_indices_list = []
+
+    def _clear_moe_stats(self):
+        """Clear accumulated routing stats before each forward pass."""
+        processed_moe_ids = set()
+        for i, block in enumerate(self.transformer.h):
+            if i not in self.moe_layer_indices:
+                continue
+            moe = block.mlp
+            moe_id = id(moe)
+            if moe_id in processed_moe_ids:
+                continue
+            processed_moe_ids.add(moe_id)
+            moe._router_logits_list = []
+            moe._topk_indices_list = []
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
@@ -582,6 +667,10 @@ class GPT(nn.Module):
         assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+
+        # Clear MoE routing stats before forward (important for shared MoE layers)
+        if self.moe_layer_indices:
+            self._clear_moe_stats()
 
         x = self.transformer.wte(idx)
         x = norm(x)
@@ -602,9 +691,15 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             # Add balance loss from all MoE layers
             if self.moe_layer_indices:
-                balance_loss = sum(self._compute_balance_loss(block.mlp)
-                                   for i, block in enumerate(self.transformer.h)
-                                   if i in self.moe_layer_indices)
+                # Use processed_moe_ids to avoid double-counting shared MoE layers
+                processed_moe_ids = set()
+                balance_loss = 0.0
+                for i, block in enumerate(self.transformer.h):
+                    if i in self.moe_layer_indices:
+                        moe_id = id(block.mlp)
+                        if moe_id not in processed_moe_ids:
+                            processed_moe_ids.add(moe_id)
+                            balance_loss += self._compute_balance_loss(block.mlp)
                 loss = loss + balance_loss
             return loss
         else:
