@@ -16,7 +16,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import argparse
 import math
 import time
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 
 import wandb
 import torch
@@ -57,7 +57,10 @@ parser.add_argument("--moe-top-k", type=int, default=3, help="number of routed e
 parser.add_argument("--balance-loss-alpha", type=float, default=0.0001, help="weight of auxiliary balance loss")
 parser.add_argument("--balance-bias-gamma", type=float, default=0.001, help="step size for bias-based load balancing")
 # Parameter sharing
-parser.add_argument("--shared-mlp-groups", type=str, default="", help="which layers share MLP params (slice notation, 0-indexed: '3:6' = layers 3,4,5 share)")
+parser.add_argument("--shared-mlp-groups", type=str, default="", help="which layers share MLP params (e.g. '3:6' = one group, '3:9:3' = groups of 3, '3:6,8:11' = two groups)")
+# FP8 training
+parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
+parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -174,6 +177,61 @@ model_config_kwargs = get_model_config_kwargs(args.depth)
 model = build_model_meta(args.depth)
 model.to_empty(device=device)
 model.init_weights()
+
+# FP8 training initialization (must be before torch.compile)
+if args.fp8:
+    if device_type != "cuda":
+        print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
+    else:
+        from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+        import torch.nn as nn
+
+        def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
+            if not isinstance(mod, nn.Linear):
+                return False
+            if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
+                return False
+            return True
+
+        fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
+        convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
+        num_fp8_layers = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
+        num_skipped = sum(1 for m in model.modules() if isinstance(m, nn.Linear)) - num_fp8_layers
+        print0(f"FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8_layers} layers, skipped {num_skipped}")
+
+# Context manager to temporarily disable FP8 for BF16 evaluation
+@contextmanager
+def disable_fp8(m):
+    """Temporarily swap Float8Linear modules with nn.Linear for BF16 evaluation."""
+    import torch.nn as nn
+    fp8_locations = []
+    for name, module in m.named_modules():
+        if 'Float8' in type(module).__name__:
+            if '.' in name:
+                parent_name, attr_name = name.rsplit('.', 1)
+                parent = m.get_submodule(parent_name)
+            else:
+                parent = m
+                attr_name = name
+            fp8_locations.append((parent, attr_name, module))
+    if not fp8_locations:
+        yield
+        return
+    for parent, attr_name, fp8_module in fp8_locations:
+        linear = nn.Linear(
+            fp8_module.in_features, fp8_module.out_features,
+            bias=fp8_module.bias is not None,
+            device=fp8_module.weight.device, dtype=fp8_module.weight.dtype,
+        )
+        linear.weight = fp8_module.weight
+        if fp8_module.bias is not None:
+            linear.bias = fp8_module.bias
+        setattr(parent, attr_name, linear)
+    try:
+        yield
+    finally:
+        for parent, attr_name, fp8_module in fp8_locations:
+            setattr(parent, attr_name, fp8_module)
 
 # Checkpoint directory
 run_dir = get_run_dir()
@@ -341,7 +399,7 @@ while True:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        with autocast_ctx:
+        with disable_fp8(model), autocast_ctx:
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
@@ -358,7 +416,7 @@ while True:
     results = {}
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
-        with autocast_ctx:
+        with disable_fp8(orig_model), autocast_ctx:
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
@@ -384,7 +442,7 @@ while True:
         engine = Engine(orig_model, tokenizer)
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
-            with autocast_ctx:
+            with disable_fp8(orig_model), autocast_ctx:
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
         model.train()
