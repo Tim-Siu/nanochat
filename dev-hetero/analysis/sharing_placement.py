@@ -4,21 +4,38 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(__file__))
 
+import argparse
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from load_runs import load_d12_runs, OUTPUT_DIR
+from load_runs import load_runs, get_output_dir
 
 
 def main():
-    df = load_d12_runs()
+    parser = argparse.ArgumentParser(description="Analyze parameter sharing placement effect on quality.")
+    parser.add_argument("--depth", type=int, required=True, help="Model depth (e.g. 12, 26)")
+    parser.add_argument("--runs", type=str, default=None, help="Comma-separated whitelist of run directory names")
+    args = parser.parse_args()
+    depth = args.depth
+    whitelist = args.runs.split(",") if args.runs else None
+
+    df = load_runs(depth, whitelist=whitelist)
+    output_dir = get_output_dir(depth)
 
     # Get shared MLP runs
     shared = df[df["exp_type"] == "Shared"].sort_values("layer_start").copy()
 
+    if len(shared) == 0:
+        print(f"No shared runs found for d{depth}, skipping.")
+        return
+
     # Baseline
-    dense = df[df["exp_type"] == "Dense"].iloc[0]
+    dense_runs = df[df["exp_type"] == "Dense"]
+    if len(dense_runs) == 0:
+        print(f"No dense baseline found for d{depth}, skipping.")
+        return
+    dense = dense_runs.iloc[0]
 
     # Parse positions for labels
     positions = []
@@ -28,9 +45,14 @@ def main():
         positions.append(f"L{start+1}-{end}")
     shared["position_label"] = positions
 
+    # Compute number of shared layers from first run
+    first = shared.iloc[0]
+    parts = first["shared_mlp_groups"].split(":")
+    n_shared = int(parts[1]) - int(parts[0])
+
     x = np.arange(len(shared))
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(max(14, 4 + len(shared)), 5))
 
     # --- BPB plot ---
     bars1 = ax1.bar(x, shared["val_bpb"].values, width=0.6, color="#4C72B0", alpha=0.85)
@@ -42,7 +64,6 @@ def main():
     ax1.set_title("MLP Sharing Placement vs Validation BPB")
     ax1.legend(fontsize=9)
 
-    # Highlight best
     best_idx = shared["val_bpb"].values.argmin()
     bars1[best_idx].set_color("#2ca02c")
     bars1[best_idx].set_alpha(1.0)
@@ -69,16 +90,16 @@ def main():
         ax2.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.001,
                  f"{val:.4f}", ha="center", va="bottom", fontsize=7.5)
 
-    fig.suptitle("Effect of MLP Parameter Sharing Position (3 shared layers in 12-layer transformer)",
+    fig.suptitle(f"Effect of MLP Parameter Sharing Position ({n_shared} shared layers in {depth}-layer transformer)",
                  fontsize=12, y=1.02)
     plt.tight_layout()
-    out_path = os.path.join(OUTPUT_DIR, "sharing_placement.png")
+    out_path = os.path.join(output_dir, "sharing_placement.png")
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Saved plot to {out_path}")
 
     # Print summary
-    print("\nSharing Placement Summary (sorted by val/bpb):")
+    print(f"\nSharing Placement Summary d{depth} (sorted by val/bpb):")
     summary = shared[["position_label", "val_bpb", "core_metric"]].copy()
     summary["bpb_vs_dense"] = shared["val_bpb"].values - dense["val_bpb"]
     summary["core_vs_dense"] = shared["core_metric"].values - dense["core_metric"]
